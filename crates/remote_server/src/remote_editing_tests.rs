@@ -27,7 +27,9 @@ use fs::{FakeFs, Fs};
 use futures::FutureExt as _;
 use git::{
     Oid,
-    repository::{CommitData, GitCommitTemplate, RepoPath, Worktree as GitWorktree},
+    repository::{
+        CommitData, GitCommitTemplate, InitialGraphCommitData, RepoPath, Worktree as GitWorktree,
+    },
 };
 use gpui::{
     AppContext as _, Entity, ImageSource, IntoElement as _, SharedString, TestAppContext,
@@ -4380,6 +4382,15 @@ async fn test_remote_search_commits_streams_proto_chunks(
         .iter()
         .map(|(commit_data, _)| commit_data.sha.to_string())
         .collect::<HashSet<_>>();
+    let graph_head = commit_data.first().expect("commit data exists").0.sha;
+    fs.set_graph_commits(
+        Path::new(path!("/code/project1/.git")),
+        vec![Arc::new(InitialGraphCommitData {
+            sha: graph_head,
+            parents: Default::default(),
+            ref_names: vec!["HEAD".into()],
+        })],
+    );
     fs.set_commit_data(Path::new(path!("/code/project1/.git")), commit_data);
 
     let (project, _headless) = init_test(&fs, cx, server_cx).await;
@@ -4439,6 +4450,60 @@ async fn test_remote_search_commits_streams_proto_chunks(
 
     let actual_shas = chunks.into_iter().flatten().collect::<HashSet<_>>();
     assert_eq!(actual_shas, expected_shas);
+
+    let mut authors_stream = proto_client
+        .request_stream(proto::GetGraphAuthors {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            repository_id: repository_id.to_proto(),
+        })
+        .await
+        .expect("graph authors stream should start");
+    let mut authors = Vec::new();
+    while let Some(response) = futures::StreamExt::next(&mut authors_stream).await {
+        authors.extend(
+            response
+                .expect("graph authors chunk should succeed")
+                .authors,
+        );
+    }
+    assert_eq!(authors.len(), 1);
+    assert_eq!(
+        authors.first().map(|author| author.name.as_str()),
+        Some("Author")
+    );
+    assert_eq!(
+        authors.first().map(|author| author.email.as_str()),
+        Some("author@example.com")
+    );
+
+    let mut author_graph = proto_client
+        .request_stream(proto::GetInitialGraphData {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            repository_id: repository_id.to_proto(),
+            log_source: Some(proto::GitLogSource {
+                source: Some(proto::git_log_source::Source::HeadAuthor(
+                    "author@example.com".to_string(),
+                )),
+            }),
+            log_order: proto::get_initial_graph_data::LogOrder::DateOrder as i32,
+        })
+        .await
+        .expect("filtered graph stream should start");
+    let mut filtered_commits = Vec::new();
+    while let Some(response) = futures::StreamExt::next(&mut author_graph).await {
+        filtered_commits.extend(
+            response
+                .expect("filtered graph chunk should succeed")
+                .commits,
+        );
+    }
+    assert_eq!(
+        filtered_commits
+            .into_iter()
+            .map(|commit| commit.sha)
+            .collect::<Vec<_>>(),
+        vec![graph_head.to_string()]
+    );
 }
 
 #[gpui::test]

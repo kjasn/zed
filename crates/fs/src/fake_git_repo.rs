@@ -14,8 +14,8 @@ use git::{
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
         CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, InitialGraphCommitData, LogOrder, LogSource, PushOptions, RefEdit, Remote,
-        RepoPath, ResetMode, SearchCommitArgs, Worktree, commit_hash_search_query,
+        GitRepository, GraphAuthor, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
+        RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree, commit_hash_search_query,
         original_repo_path_from_common_dir,
     },
     stash::GitStash,
@@ -1586,17 +1586,18 @@ impl GitRepository for FakeGitRepository {
 
     fn initial_graph_data(
         &self,
-        _log_source: LogSource,
+        log_source: LogSource,
         _log_order: LogOrder,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
         let fs = self.fs.clone();
         let dot_git_path = self.dot_git_path.clone();
         async move {
-            let (graph_commits, simulated_error) =
+            let (graph_commits, commit_data, simulated_error) =
                 fs.with_git_state(&dot_git_path, false, |state| {
                     (
                         state.graph_commits.clone(),
+                        state.commit_data.clone(),
                         state.simulated_graph_error.clone(),
                     )
                 })?;
@@ -1605,6 +1606,18 @@ impl GitRepository for FakeGitRepository {
                 anyhow::bail!("{}", error);
             }
 
+            let graph_commits = match log_source {
+                LogSource::HeadAuthor(email) => graph_commits
+                    .into_iter()
+                    .filter(|commit| {
+                        matches!(
+                            commit_data.get(&commit.sha),
+                            Some(FakeCommitDataEntry::Success(data)) if data.author_email == email
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                _ => graph_commits,
+            };
             for chunk in graph_commits.chunks(GRAPH_CHUNK_SIZE) {
                 request_tx.send(chunk.to_vec()).await.ok();
             }
@@ -1613,9 +1626,35 @@ impl GitRepository for FakeGitRepository {
         .boxed()
     }
 
+    fn graph_authors(&self) -> BoxFuture<'_, Result<Vec<GraphAuthor>>> {
+        self.with_state_async(false, |state| {
+            if let Some(error) = &state.simulated_graph_error {
+                anyhow::bail!("{error}");
+            }
+            let mut seen = HashSet::default();
+            Ok(state
+                .graph_commits
+                .iter()
+                .filter_map(|commit| {
+                    let Some(FakeCommitDataEntry::Success(data)) =
+                        state.commit_data.get(&commit.sha)
+                    else {
+                        return None;
+                    };
+                    (!data.author_email.is_empty() && seen.insert(data.author_email.clone())).then(
+                        || GraphAuthor {
+                            name: data.author_name.clone(),
+                            email: data.author_email.clone(),
+                        },
+                    )
+                })
+                .collect())
+        })
+    }
+
     fn search_commits(
         &self,
-        _log_source: LogSource,
+        log_source: LogSource,
         search_args: SearchCommitArgs,
         request_tx: Sender<Oid>,
     ) -> BoxFuture<'_, Result<()>> {
@@ -1636,6 +1675,11 @@ impl GitRepository for FakeGitRepository {
                         let FakeCommitDataEntry::Success(commit_data) = entry else {
                             return None;
                         };
+                        if let LogSource::HeadAuthor(email) = &log_source
+                            && commit_data.author_email != *email
+                        {
+                            return None;
+                        }
                         if let Some(hash_query) = hash_query.as_ref() {
                             return sha
                                 .to_string()

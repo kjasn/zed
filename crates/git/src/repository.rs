@@ -52,6 +52,7 @@ pub const REMOTE_CANCELLED_BY_USER: &str = "Operation cancelled by user";
 /// %D - Ref names
 /// %x00 - Null byte separator, used to split up commit data
 static GRAPH_COMMIT_FORMAT: &str = "--format=%H%x00%P%x00%D";
+static GRAPH_AUTHOR_FILTER_FORMAT: &str = "--format=%H%x00%P%x00%D%x00%ae";
 
 /// Used to get commits that match with a search
 /// %H - Full commit hash
@@ -114,6 +115,12 @@ pub struct InitialGraphCommitData {
     pub sha: Oid,
     pub parents: SmallVec<[Oid; 1]>,
     pub ref_names: Vec<SharedString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphAuthor {
+    pub name: SharedString,
+    pub email: SharedString,
 }
 
 impl InitialGraphCommitData {
@@ -730,6 +737,8 @@ pub enum LogSource {
     Branch(SharedString),
     Sha(Oid),
     Path(RepoPath),
+    Head,
+    HeadAuthor(SharedString),
 }
 
 impl LogSource {
@@ -749,6 +758,9 @@ impl LogSource {
                 Cow::Borrowed("--"),
                 Cow::Borrowed(path.as_unix_str()),
             ],
+            LogSource::Head | LogSource::HeadAuthor(_) => {
+                vec![Cow::Borrowed("--ignore-missing"), Cow::Borrowed("HEAD")]
+            }
         };
         // Without a terminator git cannot tell a branch named `docs/rewrite` from a
         // `docs/rewrite` directory in the working tree, and refuses the argument as
@@ -1097,6 +1109,8 @@ pub trait GitRepository: Send + Sync {
         log_order: LogOrder,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>>;
+
+    fn graph_authors(&self) -> BoxFuture<'_, Result<Vec<GraphAuthor>>>;
 
     fn search_commits(
         &self,
@@ -3305,7 +3319,23 @@ impl GitRepository for RealGitRepository {
 
         async move {
             let log_source_args = log_source.get_args();
-            let mut git_log_command = vec!["log", GRAPH_COMMIT_FORMAT, log_order.as_arg()];
+            let author_email = match &log_source {
+                LogSource::HeadAuthor(email) => Some(email.clone()),
+                _ => None,
+            };
+            let author_arg = author_email
+                .as_ref()
+                .map(|email| format!("--author=<{}>", email));
+            let graph_format = if author_email.is_some() {
+                GRAPH_AUTHOR_FILTER_FORMAT
+            } else {
+                GRAPH_COMMIT_FORMAT
+            };
+            let mut git_log_command = vec!["log", graph_format, log_order.as_arg()];
+            if let Some(author_arg) = &author_arg {
+                git_log_command.push("--fixed-strings");
+                git_log_command.push(author_arg);
+            }
             git_log_command.extend(log_source_args.iter().map(|arg| arg.as_ref()));
             let mut command = git.build_command(&git_log_command);
             command.stdout(Stdio::piped());
@@ -3325,8 +3355,11 @@ impl GitRepository for RealGitRepository {
 
                 if bytes_read == 0 {
                     if !lines.is_empty() {
-                        let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
-                        if request_tx.send(commits).await.is_err() {
+                        let commits = parse_initial_graph_output(
+                            lines.iter().map(|s| s.as_str()),
+                            author_email.as_deref(),
+                        );
+                        if !commits.is_empty() && request_tx.send(commits).await.is_err() {
                             log::warn!(
                                 "initial_graph_data: receiver dropped while sending commits"
                             );
@@ -3339,8 +3372,11 @@ impl GitRepository for RealGitRepository {
                 lines.push(line);
 
                 if lines.len() >= GRAPH_CHUNK_SIZE {
-                    let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
-                    if request_tx.send(commits).await.is_err() {
+                    let commits = parse_initial_graph_output(
+                        lines.iter().map(|s| s.as_str()),
+                        author_email.as_deref(),
+                    );
+                    if !commits.is_empty() && request_tx.send(commits).await.is_err() {
                         log::warn!("initial_graph_data: receiver dropped while streaming commits");
                         break;
                     }
@@ -3367,6 +3403,69 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn graph_authors(&self) -> BoxFuture<'_, Result<Vec<GraphAuthor>>> {
+        let git = self.git_binary();
+
+        async move {
+            let mut command = git.build_command(&["log", "-z", "--format=%an%x00%ae", "HEAD"]);
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+
+            let mut child = command.spawn()?;
+            let stdout = child.stdout.take().context("failed to get stdout")?;
+            let stderr = child.stderr.take().context("failed to get stderr")?;
+            let mut reader = BufReader::new(stdout);
+            let mut seen = HashSet::new();
+            let mut authors = Vec::new();
+            let mut name_field = Vec::new();
+            let mut email_field = Vec::new();
+
+            loop {
+                name_field.clear();
+                if reader.read_until(0, &mut name_field).await? == 0 {
+                    break;
+                }
+                email_field.clear();
+                if name_field.pop() != Some(0)
+                    || reader.read_until(0, &mut email_field).await? == 0
+                    || email_field.pop() != Some(0)
+                {
+                    bail!("malformed author data in git log output");
+                }
+
+                if !email_field.is_empty() && !seen.contains(email_field.as_slice()) {
+                    seen.insert(email_field.clone());
+                    authors.push(GraphAuthor {
+                        name: SharedString::from(String::from_utf8_lossy(&name_field).into_owned()),
+                        email: SharedString::from(
+                            String::from_utf8_lossy(&email_field).into_owned(),
+                        ),
+                    });
+                }
+            }
+
+            let status = child.status().await?;
+            if !status.success() {
+                let mut stderr_output = String::new();
+                BufReader::new(stderr)
+                    .read_to_string(&mut stderr_output)
+                    .await?;
+                if !git
+                    .build_command(&["rev-parse", "--verify", "HEAD"])
+                    .status()
+                    .await?
+                    .success()
+                {
+                    return Ok(Vec::new());
+                }
+                bail!("git log HEAD failed with {status}: {stderr_output}");
+            }
+
+            Ok(authors)
+        }
+        .boxed()
+    }
+
     fn search_commits(
         &self,
         log_source: LogSource,
@@ -3377,19 +3476,37 @@ impl GitRepository for RealGitRepository {
 
         async move {
             let log_source_args = log_source.get_args();
-            let mut args = vec!["log", SEARCH_COMMIT_FORMAT];
+            let author_email = match &log_source {
+                LogSource::HeadAuthor(email) => Some(email.clone()),
+                _ => None,
+            };
+            let author_arg = author_email
+                .as_ref()
+                .map(|email| format!("--author=<{}>", email));
+            let format = if author_email.is_some() {
+                "--format=%H%x00%ae"
+            } else {
+                SEARCH_COMMIT_FORMAT
+            };
+            let mut args = vec!["log", format];
             let hash_query = commit_hash_search_query(search_args.query.as_str())
                 .map(|query| query.to_ascii_lowercase());
 
-            if hash_query.is_none() {
+            if hash_query.is_none() || author_arg.is_some() {
                 args.push("--fixed-strings");
+            }
 
+            if hash_query.is_none() {
                 if !search_args.case_sensitive {
                     args.push("--regexp-ignore-case");
                 }
 
                 args.push("--grep");
                 args.push(search_args.query.as_str());
+            }
+
+            if let Some(author_arg) = &author_arg {
+                args.push(author_arg.as_str());
             }
 
             args.extend(log_source_args.iter().map(|arg| arg.as_ref()));
@@ -3411,7 +3528,18 @@ impl GitRepository for RealGitRepository {
                     break;
                 }
 
-                let sha = line_buffer.trim_end_matches('\n');
+                let line = line_buffer.trim_end_matches('\n');
+                let sha = if let Some(author_email) = &author_email {
+                    let Some((sha, email)) = line.split_once('\x00') else {
+                        continue;
+                    };
+                    if email != author_email.as_ref() {
+                        continue;
+                    }
+                    sha
+                } else {
+                    line
+                };
                 if let Some(hash_query) = hash_query.as_ref()
                     && !sha.to_ascii_lowercase().starts_with(hash_query)
                 {
@@ -3639,6 +3767,7 @@ fn parse_file_history_changed_files_output(
 
 fn parse_initial_graph_output<'a>(
     lines: impl Iterator<Item = &'a str>,
+    author_email: Option<&str>,
 ) -> Vec<Arc<InitialGraphCommitData>> {
     lines
         .filter(|line| !line.is_empty())
@@ -3654,6 +3783,11 @@ fn parse_initial_graph_output<'a>(
                 .collect();
 
             let ref_names_str = parts.next().unwrap_or("");
+            if let Some(author_email) = author_email
+                && parts.next() != Some(author_email)
+            {
+                return None;
+            }
             let ref_names = if ref_names_str.is_empty() {
                 Vec::new()
             } else {
@@ -5303,7 +5437,7 @@ mod tests {
     #[test]
     fn test_parse_initial_graph_output_filters_graft_decorations() {
         let line = "0f36a166633a057bf7dd660508d237cad2606cab\x00\x00grafted, HEAD -> refs/heads/main, refs/remotes/origin/main";
-        let commits = parse_initial_graph_output([line].into_iter());
+        let commits = parse_initial_graph_output([line].into_iter(), None);
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].parents.len(), 0);
         assert_eq!(
@@ -5349,6 +5483,176 @@ mod tests {
         let graph_data = request_rx.recv().await.unwrap();
         assert_eq!(graph_data.len(), 1);
         assert_eq!(graph_data[0].sha, commit_sha);
+    }
+
+    #[gpui::test]
+    async fn test_graph_authors_empty_history(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        git_init_repo(directory.path());
+        let repository = RealGitRepository::new(
+            &directory.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        assert!(repository.graph_authors().await.unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_head_author_history_and_search_use_complete_email(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        git_init_repo(directory.path());
+        let commit = |name: &str, email: &str, message: &str| {
+            let output = std::process::Command::new("git")
+                .args(["commit", "--allow-empty", "-m", message])
+                .current_dir(directory.path())
+                .env("GIT_CONFIG_GLOBAL", "")
+                .env("GIT_CONFIG_SYSTEM", "")
+                .env("GIT_AUTHOR_NAME", name)
+                .env("GIT_AUTHOR_EMAIL", email)
+                .env("GIT_COMMITTER_NAME", name)
+                .env("GIT_COMMITTER_EMAIL", email)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            git_command_output(directory.path(), ["rev-parse", "HEAD"])
+                .parse::<Oid>()
+                .unwrap()
+        };
+        let first = commit("Same Name", "a+b@example.com", "shared subject");
+        git_command(directory.path(), ["branch", "other"]);
+        let second = commit("Same Name", "ab@example.com", "shared subject");
+        let third = commit("Recent Name", "a+b@example.com", "different subject");
+        git_command(directory.path(), ["checkout", "other"]);
+        let other_head = commit("Same Name", "other@example.com", "shared subject");
+
+        let repository = RealGitRepository::new(
+            &directory.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        repository
+            .initial_graph_data(LogSource::Head, LogOrder::DateOrder, sender)
+            .await
+            .unwrap();
+        let history = receiver.recv().await.unwrap();
+        assert_eq!(
+            history.iter().map(|commit| commit.sha).collect::<Vec<_>>(),
+            vec![other_head, first]
+        );
+        assert_eq!(
+            repository.graph_authors().await.unwrap(),
+            vec![
+                GraphAuthor {
+                    name: "Same Name".into(),
+                    email: "other@example.com".into(),
+                },
+                GraphAuthor {
+                    name: "Same Name".into(),
+                    email: "a+b@example.com".into(),
+                },
+            ]
+        );
+
+        git_command(
+            directory.path(),
+            ["checkout", "--detach", &third.to_string()],
+        );
+        let dotted = commit("Same Name", "a.b@example.com", "dotted subject");
+        let lookalike = commit("Same Name", "axb@example.com", "lookalike subject");
+        let spoofed = commit(
+            "Spoof <a+b@example.com>",
+            "spoof@example.com",
+            "spoofed name",
+        );
+        let authors = repository.graph_authors().await.unwrap();
+        assert_eq!(
+            authors.first().map(|author| author.email.as_ref()),
+            Some("spoof@example.com")
+        );
+        assert!(authors.iter().any(|author| {
+            author.name.as_ref() == "Recent Name" && author.email.as_ref() == "a+b@example.com"
+        }));
+        assert!(
+            !authors
+                .iter()
+                .any(|author| author.email.as_ref() == "other@example.com")
+        );
+        let (sender, receiver) = async_channel::unbounded();
+        repository
+            .initial_graph_data(
+                LogSource::HeadAuthor("a.b@example.com".into()),
+                LogOrder::DateOrder,
+                sender,
+            )
+            .await
+            .unwrap();
+        let dotted_history = receiver.recv().await.unwrap();
+        assert_eq!(
+            dotted_history
+                .iter()
+                .map(|commit| commit.sha)
+                .collect::<Vec<_>>(),
+            vec![dotted]
+        );
+        assert!(!dotted_history.iter().any(|commit| commit.sha == lookalike));
+        let (sender, receiver) = async_channel::unbounded();
+        repository
+            .initial_graph_data(
+                LogSource::HeadAuthor("a+b@example.com".into()),
+                LogOrder::DateOrder,
+                sender,
+            )
+            .await
+            .unwrap();
+        let history = receiver.recv().await.unwrap();
+        assert_eq!(
+            history.iter().map(|commit| commit.sha).collect::<Vec<_>>(),
+            vec![third, first]
+        );
+        assert!(!history.iter().any(|commit| commit.sha == second));
+        assert!(!history.iter().any(|commit| commit.sha == spoofed));
+
+        let (sender, receiver) = async_channel::unbounded();
+        repository
+            .search_commits(
+                LogSource::HeadAuthor("a+b@example.com".into()),
+                SearchCommitArgs {
+                    query: "shared subject".into(),
+                    case_sensitive: false,
+                },
+                sender,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), first);
+        assert!(receiver.try_recv().is_err());
+
+        let (sender, receiver) = async_channel::unbounded();
+        repository
+            .search_commits(
+                LogSource::HeadAuthor("a+b@example.com".into()),
+                SearchCommitArgs {
+                    query: third.to_string().into(),
+                    case_sensitive: false,
+                },
+                sender,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), third);
     }
 
     /// A branch whose name also names a path in the working tree - `docs/rewrite` in a

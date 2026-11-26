@@ -34,8 +34,8 @@ use project::project_settings::ProjectSettings;
 use project::{
     ProjectPath, TaskSourceKind,
     git_store::{
-        CommitDataState, CommitDiff, CommitFile, GitGraphEvent, GitStore, GitStoreEvent,
-        GraphDataResponse, Repository, RepositoryEvent, RepositoryId,
+        AuthorGraphCachePin, CommitDataState, CommitDiff, CommitFile, GitGraphEvent, GitStore,
+        GitStoreEvent, GraphDataResponse, Repository, RepositoryEvent, RepositoryId,
     },
 };
 use settings::{GitDateStyle, RegisterSetting, Settings};
@@ -57,11 +57,12 @@ use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, DiffStat,
-    Disclosure, Divider, HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem,
-    ListItemSpacing, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
-    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
-    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
+    Disclosure, Divider, HeaderResizeInfo, HighlightedLabel, IndentGuideColors, Indicator,
+    ListItem, ListItemSpacing, RedistributableColumnsState, ScrollableHandle, Table,
+    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar,
+    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
+    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
+    table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -82,6 +83,7 @@ const TREE_INDENT: f32 = 20.0;
 const TABLE_COLUMN_COUNT: usize = 4;
 const REFS_COLUMN_INDEX: usize = 0;
 const GRAPH_COLUMN_INDEX: usize = 1;
+const AUTHOR_COLUMN_INDEX: usize = 4;
 const GRAPH_LAYOUT_TABLE_OFFSET: usize = 2;
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
@@ -106,6 +108,176 @@ impl CopiedState {
 }
 
 struct DraggedSplitHandle;
+
+struct AuthorPicker {
+    picker: Entity<Picker<AuthorPickerDelegate>>,
+}
+
+impl AuthorPicker {
+    fn new(
+        graph: WeakEntity<GitGraph>,
+        authors: Vec<(SharedString, SharedString)>,
+        selected_author: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let matches = (0..authors.len()).collect();
+        let selected_index = selected_author
+            .as_ref()
+            .and_then(|email| {
+                authors
+                    .iter()
+                    .position(|(_, author_email)| author_email == email)
+            })
+            .map_or(0, |index| index + 1);
+        let search_terms = authors
+            .iter()
+            .map(|(name, email)| (name.to_lowercase(), email.to_lowercase()))
+            .collect();
+        let delegate = AuthorPickerDelegate {
+            picker: cx.weak_entity(),
+            graph,
+            authors,
+            search_terms,
+            selected_author,
+            matches,
+            selected_index,
+        };
+        let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx));
+        Self { picker }
+    }
+}
+
+impl EventEmitter<DismissEvent> for AuthorPicker {}
+impl ModalView for AuthorPicker {}
+
+impl Focusable for AuthorPicker {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.picker.focus_handle(cx)
+    }
+}
+
+impl Render for AuthorPicker {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().child(self.picker.clone())
+    }
+}
+
+struct AuthorPickerDelegate {
+    picker: WeakEntity<AuthorPicker>,
+    graph: WeakEntity<GitGraph>,
+    authors: Vec<(SharedString, SharedString)>,
+    search_terms: Vec<(String, String)>,
+    selected_author: Option<SharedString>,
+    matches: Vec<usize>,
+    selected_index: usize,
+}
+
+impl PickerDelegate for AuthorPickerDelegate {
+    type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "git-graph-author"
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Search names and emails…".into()
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len() + 1
+    }
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        index: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = index;
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        let query = query.to_lowercase();
+        self.matches = self
+            .search_terms
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (name, email))| {
+                (name.contains(&query) || email.contains(&query)).then_some(index)
+            })
+            .collect();
+        self.selected_index = if query.is_empty() {
+            self.selected_author
+                .as_ref()
+                .and_then(|email| {
+                    self.matches
+                        .iter()
+                        .position(|index| &self.authors[*index].1 == email)
+                })
+                .map_or(0, |index| index + 1)
+        } else {
+            0
+        };
+        Task::ready(())
+    }
+
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let email = if self.selected_index == 0 {
+            None
+        } else {
+            let Some(email) = self
+                .matches
+                .get(self.selected_index - 1)
+                .and_then(|index| self.authors.get(*index))
+                .map(|(_, email)| email.clone())
+            else {
+                return;
+            };
+            Some(email)
+        };
+        self.graph
+            .update(cx, |graph, cx| graph.set_author(email, cx))
+            .log_err();
+        self.dismissed(window, cx);
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        self.picker
+            .update(cx, |_, cx| cx.emit(DismissEvent))
+            .log_err();
+    }
+
+    fn render_match(
+        &self,
+        index: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let label = if index == 0 {
+            "All authors".to_string()
+        } else {
+            let (name, email) = self.authors.get(*self.matches.get(index - 1)?)?;
+            format!("{} <{}>", name, email)
+        };
+        Some(
+            ListItem::new(index)
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(Label::new(label)),
+        )
+    }
+}
 
 struct CommitTagPicker {
     picker: Entity<Picker<CommitTagPickerDelegate>>,
@@ -1073,6 +1245,17 @@ impl GraphData {
 
         self.max_commit_count = AllCommitCount::Loading(self.commits.len());
     }
+
+    fn add_filtered_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
+        self.commits.extend(commits.iter().cloned().map(|data| {
+            Rc::new(CommitEntry {
+                data,
+                lane: 0,
+                color_idx: 0,
+            })
+        }));
+        self.max_commit_count = AllCommitCount::Loading(self.commits.len());
+    }
 }
 
 pub fn init(cx: &mut App) {
@@ -1467,6 +1650,9 @@ pub struct GitGraph {
     /// Per-column visibility mask owned by the view (not the resize state) so columns can be
     /// hidden regardless of whether the table is resizable. `true` means the column is hidden.
     column_visibility: TableRow<bool>,
+    selected_author: Option<SharedString>,
+    author_graph_pin: Option<(RepositoryId, LogSource, LogOrder, AuthorGraphCachePin)>,
+    authors: Option<Vec<(SharedString, SharedString)>>,
     selected_entry_idx: Option<usize>,
     selected_commit_sha: Option<Oid>,
     hovered_entry_idx: Option<usize>,
@@ -1491,6 +1677,76 @@ pub struct GitGraph {
 }
 
 impl GitGraph {
+    fn add_graph_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
+        if self.selected_author.is_some() {
+            self.graph_data.add_filtered_commits(commits);
+        } else {
+            self.graph_data.add_commits(commits);
+        }
+    }
+    fn effective_log_source(&self) -> LogSource {
+        self.selected_author
+            .as_ref()
+            .map(|email| LogSource::HeadAuthor(email.clone()))
+            .unwrap_or_else(|| self.log_source.clone())
+    }
+
+    fn refresh_author_graph_pin(&mut self, cx: &mut App) {
+        let source = self.effective_log_source();
+        if !matches!(source, LogSource::HeadAuthor(_)) {
+            self.author_graph_pin = None;
+            return;
+        }
+        if self
+            .author_graph_pin
+            .as_ref()
+            .is_some_and(|(repository_id, pinned_source, order, _)| {
+                *repository_id == self.repo_id
+                    && pinned_source == &source
+                    && *order == self.log_order
+            })
+        {
+            return;
+        }
+        self.author_graph_pin = None;
+        if let Some(repository) = self.get_repository(cx) {
+            let pin = repository.update(cx, |repository, _| {
+                repository.pin_author_graph(source.clone(), self.log_order)
+            });
+            self.author_graph_pin = Some((self.repo_id, source, self.log_order, pin));
+        }
+    }
+
+    fn author_choices(&self, cx: &App) -> Option<Vec<(SharedString, SharedString)>> {
+        let repository = self.get_repository(cx)?;
+        let repository = repository.read(cx);
+        Some(
+            repository
+                .get_graph_authors()
+                .authors?
+                .iter()
+                .map(|author| (author.name.clone(), author.email.clone()))
+                .collect(),
+        )
+    }
+
+    fn set_author(&mut self, email: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.selected_author == email {
+            return;
+        }
+        self.selected_author = email;
+        self.refresh_author_graph_pin(cx);
+        self.table_interaction_state.update(cx, |state, cx| {
+            state.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+            cx.notify();
+        });
+        self.invalidate_state(cx);
+        if let QueryState::Pending(query) = &mut self.search_state.state {
+            let query = std::mem::take(query);
+            self.search_state.state = QueryState::Empty;
+            self.search(query, cx);
+        }
+    }
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         if self.pending_select_sha.is_none() {
             self.pending_select_sha = self.selected_commit_sha;
@@ -1575,7 +1831,9 @@ impl GitGraph {
     }
 
     fn is_graph_column_visible(&self) -> bool {
-        !self.is_path_history() && self.is_column_visible(GRAPH_COLUMN_INDEX)
+        !self.is_path_history()
+            && self.selected_author.is_none()
+            && self.is_column_visible(GRAPH_COLUMN_INDEX)
     }
 
     fn table_column_offset(&self) -> usize {
@@ -1594,12 +1852,16 @@ impl GitGraph {
             .column_widths
             .read(cx)
             .preview_fractions(window.rem_size());
-        let fractions = redistribute_hidden_fractions(&raw, Some(&self.column_visibility));
+        let mut column_visibility = self.column_visibility.clone();
+        if self.selected_author.is_some() && !self.is_path_history() {
+            column_visibility.as_mut_slice()[GRAPH_COLUMN_INDEX] = true;
+        }
+        let fractions = redistribute_hidden_fractions(&raw, Some(&column_visibility));
 
         // Hidden columns occupy no space in the layout, so report them as zero here even though
         // the shared redistribution helper preserves their stored width for when they return.
         let value = |idx: usize| {
-            if self.column_visibility.get(idx).copied().unwrap_or(false) {
+            if column_visibility.get(idx).copied().unwrap_or(false) {
                 0.0
             } else {
                 fractions[idx]
@@ -1649,6 +1911,28 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_state(
+            repo_id,
+            git_store,
+            workspace,
+            log_source,
+            None,
+            LogOrder::default(),
+            window,
+            cx,
+        )
+    }
+
+    fn new_with_state(
+        repo_id: RepositoryId,
+        git_store: Entity<GitStore>,
+        workspace: WeakEntity<Workspace>,
+        log_source: Option<LogSource>,
+        selected_author: Option<SharedString>,
+        log_order: LogOrder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify())
             .detach();
@@ -1656,7 +1940,6 @@ impl GitGraph {
         let accent_colors = cx.theme().accents();
         let graph = GraphData::new(accent_colors_count(accent_colors));
         let log_source = log_source.unwrap_or_default();
-        let log_order = LogOrder::default();
 
         cx.subscribe(&git_store, |this, _, event, cx| match event {
             GitStoreEvent::RepositoryUpdated(updated_repo_id, repo_event, _) => {
@@ -1765,6 +2048,9 @@ impl GitGraph {
             table_interaction_state,
             column_widths,
             column_visibility,
+            selected_author,
+            author_graph_pin: None,
+            authors: None,
             selected_entry_idx: None,
             selected_commit_sha: None,
             hovered_entry_idx: None,
@@ -1799,7 +2085,7 @@ impl GitGraph {
     ) {
         match event {
             RepositoryEvent::GraphEvent((source, order), event)
-                if source == &self.log_source && order == &self.log_order =>
+                if source == &self.effective_log_source() && order == &self.log_order =>
             {
                 match event {
                     GitGraphEvent::FullyLoaded => {
@@ -1842,7 +2128,7 @@ impl GitGraph {
                                     old_count..*commit_count,
                                     cx,
                                 );
-                                self.graph_data.add_commits(commits);
+                                self.add_graph_commits(commits);
 
                                 let pending_sha_index = self.pending_select_sha.and_then(|oid| {
                                     repository.get_graph_data(source.clone(), *order).and_then(
@@ -1867,12 +2153,25 @@ impl GitGraph {
             RepositoryEvent::TagsChanged => {
                 self.invalidate_state(cx);
             }
-            RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged => {
-                // Only invalidate if we scanned atleast once,
-                // meaning we are not inside the initial repo loading state
-                // NOTE: this fixes an loading performance regression
-                if repository.read(cx).scan_id > 1 {
+            RepositoryEvent::GraphAuthorsLoaded => {
+                self.authors = self.author_choices(cx);
+                cx.notify();
+            }
+            RepositoryEvent::HeadChanged
+            | RepositoryEvent::HistoryChanged
+            | RepositoryEvent::BranchListChanged => {
+                // Initial scan events do not need a second graph load.
+                if repository.read(cx).scan_id > 1
+                    || matches!(event, RepositoryEvent::HistoryChanged)
+                {
                     self.invalidate_state(cx);
+                    self.authors = None;
+                    if !self.is_path_history() {
+                        repository.update(cx, |repository, cx| {
+                            repository.graph_authors(cx);
+                        });
+                        self.authors = self.author_choices(cx);
+                    }
                 }
             }
             RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
@@ -1887,13 +2186,27 @@ impl GitGraph {
     }
 
     fn fetch_initial_graph_data(&mut self, cx: &mut App) {
+        self.refresh_author_graph_pin(cx);
         if let Some(repository) = self.get_repository(cx) {
             repository.update(cx, |repository, cx| {
                 let commits = repository
-                    .graph_data(self.log_source.clone(), self.log_order, 0..usize::MAX, cx)
+                    .graph_data(
+                        self.effective_log_source(),
+                        self.log_order,
+                        0..usize::MAX,
+                        cx,
+                    )
                     .commits;
-                self.graph_data.add_commits(commits);
+                self.add_graph_commits(commits);
             });
+        }
+        if !self.is_path_history()
+            && let Some(repository) = self.get_repository(cx)
+        {
+            repository.update(cx, |repository, cx| {
+                repository.graph_authors(cx);
+            });
+            self.authors = self.author_choices(cx);
         }
     }
 
@@ -2294,7 +2607,7 @@ impl GitGraph {
 
         repo.update(cx, |repo, cx| {
             repo.search_commits(
-                self.log_source.clone(),
+                self.effective_log_source(),
                 SearchCommitArgs {
                     query: query.clone(),
                     case_sensitive: self.search_state.case_sensitive,
@@ -2566,8 +2879,11 @@ impl GitGraph {
                 .contains_key(&repo_id)
         {
             self.repo_id = repo_id;
+            self.selected_author = None;
+            self.authors = None;
             self.clear_selection();
             self.invalidate_state(cx);
+            self.fetch_initial_graph_data(cx);
         }
     }
 
@@ -2579,7 +2895,7 @@ impl GitGraph {
 
             let Some(index) = selected_repository
                 .read(cx)
-                .get_graph_data(this.log_source.clone(), this.log_order)
+                .get_graph_data(this.effective_log_source(), this.log_order)
                 .and_then(|data| data.commit_oid_to_index.get(&oid))
                 .copied()
             else {
@@ -2868,6 +3184,130 @@ impl GitGraph {
         }
     }
 
+    fn open_author_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(authors) = self.authors.clone() else {
+            return;
+        };
+        let graph = cx.weak_entity();
+        let selected_author = self.selected_author.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    AuthorPicker::new(graph, authors, selected_author, window, cx)
+                });
+            })
+            .log_err();
+    }
+
+    fn render_author_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tooltip = if let Some(error) = self
+            .get_repository(cx)
+            .and_then(|repository| repository.read(cx).get_graph_authors().error.cloned())
+        {
+            format!("Authors: {error}")
+        } else if self.authors.is_none() {
+            "Loading authors…".to_string()
+        } else if let Some(email) = &self.selected_author {
+            let name = self.authors.as_ref().and_then(|authors| {
+                authors
+                    .iter()
+                    .find(|(_, author_email)| author_email == email)
+                    .map(|(name, _)| name)
+            });
+            name.map_or_else(
+                || format!("Filter by author: {email}"),
+                |name| format!("Filter by author: {name} <{email}>"),
+            )
+        } else {
+            "Filter by author: All authors".to_string()
+        };
+        let accessible_label = tooltip.clone();
+
+        h_flex()
+            .min_w_0()
+            .gap_1()
+            .child(Label::new("Author").color(Color::Muted).truncate())
+            .child(
+                IconButton::new("git-graph-author-filter", IconName::Filter)
+                    .aria_label(accessible_label)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.selected_author.is_some())
+                    .when(self.selected_author.is_some(), |this| {
+                        this.indicator(Indicator::dot().color(Color::Info))
+                    })
+                    .disabled(self.authors.is_none())
+                    .tooltip(move |_, cx| Tooltip::simple(tooltip.clone(), cx))
+                    .on_click(cx.listener(|graph, _, window, cx| {
+                        graph.open_author_picker(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_graph_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let is_path_history = self.is_path_history();
+        let mut column_filter = self.column_visibility.clone();
+        if self.selected_author.is_some() && !is_path_history {
+            column_filter.as_mut_slice()[GRAPH_COLUMN_INDEX] = true;
+        }
+        let header_widths = redistribute_hidden_widths(
+            &self.column_widths.read(cx).widths_to_render(),
+            Some(&column_filter),
+        );
+        let header_context = TableRenderContext::for_column_widths(Some(header_widths), true)
+            .with_column_filter(Some(column_filter));
+        let header_resize_info = HeaderResizeInfo::from_redistributable(&self.column_widths, cx);
+        let headers = if is_path_history {
+            TableRow::from_vec(
+                vec![
+                    Label::new("Description")
+                        .color(Color::Muted)
+                        .into_any_element(),
+                    Label::new("Date").color(Color::Muted).into_any_element(),
+                    Label::new("Author").color(Color::Muted).into_any_element(),
+                    Label::new("Commit").color(Color::Muted).into_any_element(),
+                ],
+                TABLE_COLUMN_COUNT,
+            )
+        } else {
+            TableRow::from_vec(
+                vec![
+                    Label::new("Refs")
+                        .color(Color::Muted)
+                        .truncate()
+                        .into_any_element(),
+                    Label::new("Graph")
+                        .color(Color::Muted)
+                        .truncate()
+                        .into_any_element(),
+                    Label::new("Description")
+                        .color(Color::Muted)
+                        .into_any_element(),
+                    Label::new("Date").color(Color::Muted).into_any_element(),
+                    self.render_author_header(cx),
+                    Label::new("Commit").color(Color::Muted).into_any_element(),
+                ],
+                GRAPH_LAYOUT_TABLE_OFFSET + TABLE_COLUMN_COUNT,
+            )
+        };
+        div()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_header_context_menu(event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(render_table_header(
+                headers,
+                header_context,
+                Some(header_resize_info),
+                Some(self.column_widths.entity_id()),
+                cx,
+            ))
+            .into_any_element()
+    }
+
     fn deploy_header_context_menu(
         &mut self,
         position: Point<Pixels>,
@@ -2882,15 +3322,32 @@ impl GitGraph {
         };
 
         let filter = self.column_visibility.clone();
+        let author_filter_active = self.selected_author.is_some();
         let visible_count = filter
             .as_slice()
             .iter()
-            .filter(|filtered| !**filtered)
+            .enumerate()
+            .filter(|(index, hidden)| {
+                !**hidden && !(author_filter_active && *index == GRAPH_COLUMN_INDEX)
+            })
             .count();
 
         let focus_handle = self.focus_handle.clone();
         let git_graph = cx.entity();
+        let authors_unavailable = self.authors.is_none();
         let context_menu = ContextMenu::build(window, cx, |mut context_menu, _window, _cx| {
+            if !is_path_history && filter.get(AUTHOR_COLUMN_INDEX).copied().unwrap_or(false) {
+                let git_graph = git_graph.clone();
+                context_menu = context_menu.item(
+                    ContextMenuEntry::new("Filter by author…")
+                        .disabled(authors_unavailable)
+                        .handler(move |window, cx| {
+                            git_graph.update(cx, |graph, cx| {
+                                graph.open_author_picker(window, cx);
+                            });
+                        }),
+                );
+            }
             context_menu = context_menu.context(focus_handle).header("Columns");
             for (col_idx, label) in columns.iter().enumerate() {
                 let is_visible = !filter.get(col_idx).copied().unwrap_or(false);
@@ -2900,7 +3357,7 @@ impl GitGraph {
                 context_menu = context_menu.toggleable_entry_disabled_when(
                     label.to_string(),
                     is_visible,
-                    !can_toggle,
+                    !can_toggle || (author_filter_active && col_idx == GRAPH_COLUMN_INDEX),
                     IconPosition::End,
                     None,
                     move |_window, cx| {
@@ -4252,7 +4709,7 @@ impl GitGraph {
                     .map(|repository| {
                         repository.update(cx, |repository, cx| {
                             repository
-                                .graph_data(self.log_source.clone(), self.log_order, 0..0, cx)
+                                .graph_data(self.effective_log_source(), self.log_order, 0..0, cx)
                                 .is_loading
                         })
                     })
@@ -4261,22 +4718,37 @@ impl GitGraph {
                 (count, is_loading)
             }
             AllCommitCount::NotLoaded => {
+                self.refresh_author_graph_pin(cx);
                 let (commit_count, is_loading) = if let Some(repository) = self.get_repository(cx) {
-                    repository.update(cx, |repository, cx| {
+                    let source = self.effective_log_source();
+                    let (commit_count, is_loading) = repository.update(cx, |repository, cx| {
                         // Start loading the graph data if we haven't started already
                         let GraphDataResponse {
                             commits,
                             is_loading,
                             error: _,
                         } = repository.graph_data(
-                            self.log_source.clone(),
+                            source.clone(),
                             self.log_order,
                             0..usize::MAX,
                             cx,
                         );
-                        self.graph_data.add_commits(commits);
+                        self.add_graph_commits(commits);
                         (commits.len(), is_loading)
-                    })
+                    });
+                    // A cached graph may already contain the selected commit without a new load event.
+                    if let Some(oid) = self.pending_select_sha {
+                        let index = repository
+                            .read(cx)
+                            .get_graph_data(source, self.log_order)
+                            .and_then(|data| data.commit_oid_to_index.get(&oid).copied());
+                        if let Some(index) = index {
+                            self.select_entry(index, ScrollStrategy::Nearest, cx);
+                        } else if !is_loading {
+                            self.pending_selection_not_found();
+                        }
+                    }
+                    (commit_count, is_loading)
                 } else {
                     (0, false)
                 };
@@ -4415,7 +4887,7 @@ impl Render for GitGraph {
 
         let error = self.get_repository(cx).and_then(|repo| {
             repo.read(cx)
-                .get_graph_data(self.log_source.clone(), self.log_order)
+                .get_graph_data(self.effective_log_source(), self.log_order)
                 .and_then(|data| data.error.clone())
         });
 
@@ -4425,26 +4897,57 @@ impl Render for GitGraph {
             } else if is_loading {
                 "Loading".to_string()
             } else {
-                "No commits found".to_string()
+                if self.selected_author.is_some() {
+                    "No commits by this author in HEAD history".to_string()
+                } else {
+                    "No commits found".to_string()
+                }
             };
             let label = Label::new(message)
                 .color(Color::Muted)
                 .size(LabelSize::Large);
 
-            h_flex()
+            v_flex()
                 .size_full()
-                .gap_1()
-                .justify_center()
-                .child(label)
-                .when(is_loading && error.is_none(), |this| {
-                    this.child(self.render_loading_spinner(cx))
-                })
+                .child(self.render_graph_header(cx))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .gap_1()
+                        .justify_center()
+                        .child(label)
+                        .when(is_loading && error.is_none(), |this| {
+                            this.child(self.render_loading_spinner(cx))
+                        })
+                        .when(
+                            self.selected_author.is_some()
+                                && self
+                                    .column_visibility
+                                    .get(AUTHOR_COLUMN_INDEX)
+                                    .copied()
+                                    .unwrap_or(false),
+                            |this| {
+                                this.child(
+                                    Button::new(
+                                        "git-graph-clear-author-filter",
+                                        "Clear author filter",
+                                    )
+                                    .on_click(cx.listener(
+                                        |graph, _, _, cx| {
+                                            graph.set_author(None, cx);
+                                        },
+                                    )),
+                                )
+                            },
+                        ),
+                )
         } else {
             let is_path_history = self.is_path_history();
-            let header_resize_info =
-                HeaderResizeInfo::from_redistributable(&self.column_widths, cx);
 
-            let column_filter = self.column_visibility.clone();
+            let mut column_filter = self.column_visibility.clone();
+            if self.selected_author.is_some() && !is_path_history {
+                column_filter.as_mut_slice()[GRAPH_COLUMN_INDEX] = true;
+            }
 
             // The refs and graph columns only exist in the non-path-history layout and are
             // rendered outside the table, in sync with its scroll position.
@@ -4457,12 +4960,6 @@ impl Render for GitGraph {
                 .get(table_offset..table_offset + TABLE_COLUMN_COUNT)
                 .map(|slice| TableRow::from_vec(slice.to_vec(), TABLE_COLUMN_COUNT))
                 .unwrap_or_else(|| TableRow::from_element(false, TABLE_COLUMN_COUNT));
-            let header_widths = redistribute_hidden_widths(
-                &self.column_widths.read(cx).widths_to_render(),
-                Some(&column_filter),
-            );
-            let header_context = TableRenderContext::for_column_widths(Some(header_widths), true)
-                .with_column_filter(Some(column_filter));
 
             let [
                 refs_fraction,
@@ -4488,67 +4985,7 @@ impl Render for GitGraph {
                         .size_full()
                         .flex()
                         .flex_col()
-                        .child(
-                            div()
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                        this.deploy_header_context_menu(event.position, window, cx);
-                                        cx.stop_propagation();
-                                    }),
-                                )
-                                .child(render_table_header(
-                                    if !is_path_history {
-                                        TableRow::from_vec(
-                                            vec![
-                                                Label::new("Refs")
-                                                    .color(Color::Muted)
-                                                    .truncate()
-                                                    .into_any_element(),
-                                                Label::new("Graph")
-                                                    .color(Color::Muted)
-                                                    .truncate()
-                                                    .into_any_element(),
-                                                Label::new("Description")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                                Label::new("Date")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                                Label::new("Author")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                                Label::new("Commit")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                            ],
-                                            GRAPH_LAYOUT_TABLE_OFFSET + TABLE_COLUMN_COUNT,
-                                        )
-                                    } else {
-                                        TableRow::from_vec(
-                                            vec![
-                                                Label::new("Description")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                                Label::new("Date")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                                Label::new("Author")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                                Label::new("Commit")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                            ],
-                                            4,
-                                        )
-                                    },
-                                    header_context,
-                                    Some(header_resize_info),
-                                    Some(self.column_widths.entity_id()),
-                                    cx,
-                                )),
-                        )
+                        .child(self.render_graph_header(cx))
                         .child({
                             let row_height = Self::row_height(window, cx);
                             let selected_entry_idx = self.selected_entry_idx;
@@ -4721,12 +5158,12 @@ impl Render for GitGraph {
                                     )
                                     .child(render_redistributable_columns_resize_handles(
                                         &self.column_widths,
-                                        Some(&self.column_visibility),
+                                        Some(&column_filter),
                                         window,
                                         cx,
                                     )),
                                 self.column_widths.clone(),
-                                Some(self.column_visibility.clone()),
+                                Some(column_filter.clone()),
                             )
                         }),
                 )
@@ -4937,6 +5374,10 @@ impl workspace::SerializableItem for GitGraph {
             return Task::ready(Err(anyhow::anyhow!("No git graph to deserialize")));
         };
 
+        let selected_author = match db.get_selected_author(item_id, workspace_id) {
+            Ok(author) => author.filter(|author| !author.is_empty()),
+            Err(error) => return Task::ready(Err(error)),
+        };
         let state = persistence::SerializedGitGraphState {
             log_source_type,
             log_source_value,
@@ -4945,6 +5386,7 @@ impl workspace::SerializableItem for GitGraph {
             search_query,
             search_case_sensitive,
             hidden_columns,
+            selected_author,
         };
 
         let window_handle = window.window_handle();
@@ -4975,9 +5417,16 @@ impl workspace::SerializableItem for GitGraph {
                 let log_order = persistence::deserialize_log_order(&state);
 
                 let git_graph = cx.new(|cx| {
-                    let mut graph =
-                        GitGraph::new(repo_id, git_store, workspace, Some(log_source), window, cx);
-                    graph.log_order = log_order;
+                    let mut graph = GitGraph::new_with_state(
+                        repo_id,
+                        git_store,
+                        workspace,
+                        Some(log_source),
+                        state.selected_author.clone().map(Into::into),
+                        log_order,
+                        window,
+                        cx,
+                    );
 
                     if let Some(sha) = &state.selected_sha {
                         graph.select_commit_by_sha(sha.as_str(), cx);
@@ -5055,23 +5504,22 @@ impl workspace::SerializableItem for GitGraph {
             self.column_visibility.as_slice(),
             persistence::hidden_column_bits(&self.log_source),
         ));
+        let selected_author = self.selected_author.as_ref().map(ToString::to_string);
 
         let db = persistence::GitGraphsDb::global(cx);
-        Some(cx.background_spawn(async move {
-            db.save_git_graph(
-                item_id,
-                workspace_id,
-                repo_working_path,
-                log_source_type,
-                log_source_value,
-                log_order,
-                selected_sha,
-                search_query,
-                search_case_sensitive,
-                hidden_columns,
-            )
-            .await
-        }))
+        let save = db.save_git_graph(
+            item_id,
+            workspace_id,
+            repo_working_path,
+            log_source_type,
+            log_source_value,
+            log_order,
+            selected_sha,
+            search_query,
+            search_case_sensitive,
+            (hidden_columns, selected_author),
+        );
+        Some(cx.background_spawn(save))
     }
 
     fn should_serialize(&self, event: &Self::Event) -> bool {
@@ -5127,6 +5575,9 @@ mod persistence {
             sql!(
                 ALTER TABLE git_graphs ADD COLUMN hidden_columns INTEGER;
             ),
+            sql!(
+                ALTER TABLE git_graphs ADD COLUMN selected_author TEXT;
+            ),
         ];
     }
 
@@ -5148,6 +5599,7 @@ mod persistence {
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
+            LogSource::Head | LogSource::HeadAuthor(_) => LOG_SOURCE_ALL,
         }
     }
 
@@ -5157,6 +5609,7 @@ mod persistence {
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
+            LogSource::Head | LogSource::HeadAuthor(_) => None,
         }
     }
 
@@ -5208,6 +5661,7 @@ mod persistence {
     pub fn hidden_column_bits(log_source: &LogSource) -> &'static [usize] {
         match log_source {
             LogSource::Path(_) => &[0, 1, 2, 3],
+            LogSource::Head | LogSource::HeadAuthor(_) => &[5, 0, 1, 2, 3, 4],
             _ => &[5, 0, 1, 2, 3, 4],
         }
     }
@@ -5242,30 +5696,57 @@ mod persistence {
         pub search_query: Option<String>,
         pub search_case_sensitive: Option<bool>,
         pub hidden_columns: Option<i32>,
+        pub selected_author: Option<String>,
     }
 
     impl GitGraphsDb {
-        query! {
-            pub async fn save_git_graph(
-                item_id: workspace::ItemId,
-                workspace_id: workspace::WorkspaceId,
-                repo_working_path: String,
-                log_source_type: Option<i32>,
-                log_source_value: Option<String>,
-                log_order: Option<i32>,
-                selected_sha: Option<String>,
-                search_query: Option<String>,
-                search_case_sensitive: Option<bool>,
-                hidden_columns: Option<i32>
-            ) -> Result<()> {
+        pub fn save_git_graph(
+            &self,
+            item_id: workspace::ItemId,
+            workspace_id: workspace::WorkspaceId,
+            repo_working_path: String,
+            log_source_type: Option<i32>,
+            log_source_value: Option<String>,
+            log_order: Option<i32>,
+            selected_sha: Option<String>,
+            search_query: Option<String>,
+            search_case_sensitive: Option<bool>,
+            hidden_columns_and_selected_author: (Option<i32>, Option<String>),
+        ) -> impl Future<Output = anyhow::Result<()>> + use<> {
+            self.write(move |connection| {
+                let mut insert = connection.exec_bound::<(
+                    workspace::ItemId,
+                    workspace::WorkspaceId,
+                    String,
+                    Option<i32>,
+                    Option<String>,
+                    Option<i32>,
+                    Option<String>,
+                    Option<String>,
+                    Option<bool>,
+                    (Option<i32>, Option<String>),
+                )>(sql!(
                 INSERT OR REPLACE INTO git_graphs(
                     item_id, workspace_id, repo_working_path,
                     log_source_type, log_source_value, log_order,
                     selected_sha, search_query, search_case_sensitive,
-                    hidden_columns
+                    hidden_columns, selected_author
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            }
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ))?;
+                insert((
+                    item_id,
+                    workspace_id,
+                    repo_working_path,
+                    log_source_type,
+                    log_source_value,
+                    log_order,
+                    selected_sha,
+                    search_query,
+                    search_case_sensitive,
+                    hidden_columns_and_selected_author,
+                ))
+            })
         }
 
         query! {
@@ -5293,6 +5774,15 @@ mod persistence {
                     hidden_columns
                 FROM git_graphs
                 WHERE item_id = ? AND workspace_id = ?
+            }
+        }
+
+        query! {
+            pub fn get_selected_author(
+                item_id: workspace::ItemId,
+                workspace_id: workspace::WorkspaceId
+            ) -> Result<Option<String>> {
+                SELECT selected_author FROM git_graphs WHERE item_id = ? AND workspace_id = ?
             }
         }
     }
@@ -6969,6 +7459,7 @@ mod tests {
             search_query: Some("fix bug".to_string()),
             search_case_sensitive: Some(true),
             hidden_columns: None,
+            selected_author: None,
         };
 
         assert_eq!(
@@ -6994,6 +7485,7 @@ mod tests {
             search_query: None,
             search_case_sensitive: None,
             hidden_columns: None,
+            selected_author: None,
         };
         assert_eq!(
             persistence::deserialize_log_source(&all_state),
@@ -7164,7 +7656,7 @@ mod tests {
             selected_sha.clone(),
             Some("some query".to_string()),
             Some(true),
-            Some(hidden_columns),
+            (Some(hidden_columns), None),
         )
         .await
         .expect("save should succeed");
@@ -7173,7 +7665,7 @@ mod tests {
             .update(|window, cx| {
                 <GitGraph as workspace::SerializableItem>::deserialize(
                     project.clone(),
-                    workspace_weak,
+                    workspace_weak.clone(),
                     workspace_id,
                     item_id,
                     window,
@@ -7232,6 +7724,97 @@ mod tests {
                 editor_text, "some query",
                 "search query text should be restored in editor"
             );
+        });
+
+        db.save_git_graph(
+            item_id,
+            workspace_id,
+            "/project".to_string(),
+            Some(persistence::LOG_SOURCE_ALL),
+            None,
+            Some(persistence::LOG_ORDER_DATE),
+            None,
+            None,
+            Some(false),
+            (Some(hidden_columns), Some("author@example.com".to_string())),
+        )
+        .await
+        .expect("save author filter");
+        let filtered_graph = cx
+            .update(|window, cx| {
+                <GitGraph as workspace::SerializableItem>::deserialize(
+                    project.clone(),
+                    workspace_weak.clone(),
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("restore author filter");
+        cx.run_until_parked();
+        filtered_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.selected_author.as_deref(), Some("author@example.com"));
+            assert!(graph.author_graph_pin.is_some());
+            assert!(!graph.is_graph_column_visible());
+            assert_eq!(
+                graph.column_visibility.as_slice(),
+                &[true, false, false, true, false, false]
+            );
+        });
+        filtered_graph.update(cx, |graph, cx| graph.set_author(None, cx));
+        filtered_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.selected_author, None);
+            assert!(graph.author_graph_pin.is_none());
+            assert!(graph.is_graph_column_visible());
+            assert_eq!(
+                graph.column_visibility.as_slice(),
+                &[true, false, false, true, false, false]
+            );
+        });
+        let save_filtered = db.save_git_graph(
+            item_id,
+            workspace_id,
+            "/project".to_string(),
+            Some(persistence::LOG_SOURCE_ALL),
+            None,
+            Some(persistence::LOG_ORDER_DATE),
+            None,
+            None,
+            Some(false),
+            (Some(hidden_columns), Some("author@example.com".to_string())),
+        );
+        let save_cleared = db.save_git_graph(
+            item_id,
+            workspace_id,
+            "/project".to_string(),
+            Some(persistence::LOG_SOURCE_ALL),
+            None,
+            Some(persistence::LOG_ORDER_DATE),
+            None,
+            None,
+            Some(false),
+            (Some(hidden_columns), None),
+        );
+        save_cleared.await.expect("clear saved author");
+        save_filtered.await.expect("save older author filter");
+        let cleared_graph = cx
+            .update(|window, cx| {
+                <GitGraph as workspace::SerializableItem>::deserialize(
+                    project.clone(),
+                    workspace_weak,
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("restore cleared filter");
+        cleared_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.selected_author, None);
+            assert!(graph.is_graph_column_visible());
         });
     }
 

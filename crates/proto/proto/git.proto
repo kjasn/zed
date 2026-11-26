@@ -760,6 +760,8 @@ message GitLogSource {
     string branch = 2;
     string sha = 3;
     string path = 4;
+    GitLogSourceAll head = 5;
+    string head_author = 6;
   }
 }
 
@@ -785,6 +787,20 @@ message InitialGraphCommit {
 
 message GetInitialGraphDataResponse {
   repeated InitialGraphCommit commits = 1;
+}
+
+message GetGraphAuthors {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+}
+
+message GraphAuthor {
+  string name = 1;
+  string email = 2;
+}
+
+message GetGraphAuthorsResponse {
+  repeated GraphAuthor authors = 1;
 }
 
 message SearchCommits {
